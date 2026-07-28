@@ -63,4 +63,3 @@ func TestEncodeBodyLengthIsCorrect(t *testing.T) {
 		t.Fatalf("framed len = %d, want %d (BodyLength must exactly cover the message)", len(framed), len(raw))
 	}
 }
-

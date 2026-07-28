@@ -143,4 +143,3 @@ func TestSessionLogonAndAppRoundTrip(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
-

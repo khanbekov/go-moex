@@ -19,17 +19,17 @@ orderbook packages exactly as forts does — never section-specific code.
 MAIN FUNCTIONS:
   - NewClient(cfg)     : constructor with Config validation and defaults.
   - (Client).Forts()   : returns the FORTS-profile sub-client. Created
-                         lazily on first access.
+    lazily on first access.
   - (Client).Close()   : gracefully shuts down background operations
-                         (FIX sessions, SIMBA listeners). Non-blocking.
+    (FIX sessions, SIMBA listeners). Non-blocking.
 
 MAIN ENTITIES:
   - Client            : root SDK object.
   - fortsClientCtor    : internal contract through which the forts package
-                        creates its client. Avoids an import cycle between
-                        the root (where Client lives) and forts (where
-                        forts.Client lives) — identical pattern to
-                        okx.RegisterSwapFactory in go-okx.
+    creates its client. Avoids an import cycle between
+    the root (where Client lives) and forts (where
+    forts.Client lives) — identical pattern to
+    okx.RegisterSwapFactory in go-okx.
 
 DEPENDENCIES:
   - sync: lazy sub-client initialization.

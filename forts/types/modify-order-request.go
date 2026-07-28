@@ -17,8 +17,8 @@ type ModifyOrderRequest struct {
 	Side   Side
 	// ClientOrderID — new ClOrdID for the replaced order (tag 11, mandatory).
 	// If empty, the SDK generates one.
-	ClientOrderID string
-	OrderID       int64
+	ClientOrderID     string
+	OrderID           int64
 	OrigClientOrderID string
 	// NewPrice — new limit price (tag 44, mandatory for OrdType=Limit).
 	NewPrice decimal.Decimal

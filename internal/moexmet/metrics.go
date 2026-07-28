@@ -50,5 +50,5 @@ var (
 
 func (noopFactory) Counter(string, ...string) Counter { return noopCounterSingleton }
 
-func (noopCounter) Inc()         {}
+func (noopCounter) Inc()        {}
 func (noopCounter) Add(float64) {}

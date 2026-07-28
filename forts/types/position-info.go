@@ -18,6 +18,7 @@ lifetime — see forts/account.go. This means:
   - they are WRONG (start from zero) for positions that already existed
     before the process started, until reconciled from an external source
     (e.g. a broker EOD/clearing report) via AccountClient.SeedPosition.
+
 This is a deliberate, documented trade-off — NOT a silent approximation.
 */
 package types

@@ -35,7 +35,7 @@ type OrderInfo struct {
 	// CumQty — total filled size in contracts (tag 14).
 	CumQty int64
 	// AvgPx — average fill price (tag 6).
-	AvgPx decimal.Decimal
+	AvgPx  decimal.Decimal
 	Status OrdStatus
 	// Account — client account code (tag 1, up to 7 chars on Execution
 	// Report; 3 chars when submitted on New Order Single).
