@@ -121,6 +121,31 @@ func TestDecodeBestPricesWithTwoEntries(t *testing.T) {
 	}
 }
 
+func TestDecodeSecurityDefinitionPrefix(t *testing.T) {
+	var body [4 + 25 + 4]byte
+	binary.LittleEndian.PutUint32(body[0:4], 1) // TotNumReports
+	copy(body[4:29], []byte("Si-12.25"))        // Symbol, padded with zero bytes.
+	binary.LittleEndian.PutUint32(body[29:33], 987654)
+
+	var packet []byte = buildPacket(0, false, TemplateSecurityDefinition, uint16(len(body)), body[:])
+
+	var decoded Decoded
+	var err error
+	decoded, err = DecodePacket(packet)
+	if err != nil {
+		t.Fatalf("DecodePacket: %v", err)
+	}
+	if decoded.SecurityDefinition == nil {
+		t.Fatal("expected non-nil SecurityDefinition")
+	}
+	if decoded.SecurityDefinition.Symbol != "Si-12.25" {
+		t.Errorf("Symbol = %q, want %q", decoded.SecurityDefinition.Symbol, "Si-12.25")
+	}
+	if decoded.SecurityDefinition.SecurityID != 987654 {
+		t.Errorf("SecurityID = %d, want 987654", decoded.SecurityDefinition.SecurityID)
+	}
+}
+
 func TestDecodeEmptyBook(t *testing.T) {
 	var body [4]byte
 	binary.LittleEndian.PutUint32(body[0:4], NullUint32)

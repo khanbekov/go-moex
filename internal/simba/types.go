@@ -93,14 +93,28 @@ type SBEHeader struct {
 
 // Message template IDs (sbe:message id=...).
 const (
-	TemplateHeartbeat         uint16 = 1
-	TemplateSequenceReset     uint16 = 2
-	TemplateEmptyBook         uint16 = 4
-	TemplateBestPrices        uint16 = 14
-	TemplateOrderUpdate       uint16 = 15
-	TemplateOrderExecution    uint16 = 16
-	TemplateOrderBookSnapshot uint16 = 17
+	TemplateHeartbeat          uint16 = 1
+	TemplateSequenceReset      uint16 = 2
+	TemplateEmptyBook          uint16 = 4
+	TemplateBestPrices         uint16 = 14
+	TemplateOrderUpdate        uint16 = 15
+	TemplateOrderExecution     uint16 = 16
+	TemplateOrderBookSnapshot  uint16 = 17
+	TemplateSecurityDefinition uint16 = 27
 )
+
+// SecurityDefinition — PARTIAL decode of SecurityDefinition(27): only the
+// Symbol<->SecurityID mapping fields, which happen to be the first three
+// fields of the root block (TotNumReports uint32 + Symbol String25 +
+// SecurityID Int32, byte offsets 0/4/29 — see decode.go). The message has
+// many more fields (margins, price limits, CFICode, event dates, ...)
+// that v1.0 does not need and therefore does not decode — see
+// decode.go doc for why reading a fixed-offset prefix of an SBE root
+// block is safe to do without decoding the rest.
+type SecurityDefinition struct {
+	Symbol     string
+	SecurityID int32
+}
 
 // BestPricesEntry — one entry of the BestPrices(14) repeating group
 // (36 bytes: Decimal5NULL x2 + Int64NULL x2 + Int32).

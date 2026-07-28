@@ -84,11 +84,12 @@ type Decoded struct {
 	Incremental *IncrementalHeader
 	SBE         SBEHeader
 
-	BestPrices        *BestPrices
-	EmptyBook         *EmptyBook
-	OrderUpdate       *OrderUpdate
-	OrderExecution    *OrderExecution
-	OrderBookSnapshot *OrderBookSnapshot
+	BestPrices         *BestPrices
+	EmptyBook          *EmptyBook
+	OrderUpdate        *OrderUpdate
+	OrderExecution     *OrderExecution
+	OrderBookSnapshot  *OrderBookSnapshot
+	SecurityDefinition *SecurityDefinition
 	// NewSeqNo — populated for SequenceReset(2); the session-level
 	// resync value the caller should adopt for gap tracking.
 	NewSeqNo *uint32
@@ -163,6 +164,13 @@ func DecodePacket(buf []byte) (Decoded, error) {
 			return out, err
 		}
 		out.OrderBookSnapshot = obs
+	case TemplateSecurityDefinition:
+		var sd *SecurityDefinition
+		sd, err = decodeSecurityDefinitionPrefix(rest)
+		if err != nil {
+			return out, err
+		}
+		out.SecurityDefinition = sd
 	default:
 		// Unknown/unsupported template (SecurityDefinition, SecurityStatus,
 		// TradingSessionStatus, ...) — not an error, just not decoded in v1.0.
@@ -256,6 +264,29 @@ func decodeOrderExecution(buf []byte) (*OrderExecution, error) {
 
 const orderBookSnapshotRootSize = 4 + 4 + 4 + 4                  // 16
 const orderBookSnapshotEntrySize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 1 // 57
+
+// decodeSecurityDefinitionPrefix reads only the TotNumReports(uint32) +
+// Symbol(String25, fixed-width, NUL/space-padded) + SecurityID(Int32)
+// prefix of the SecurityDefinition(27) root block — see the
+// SecurityDefinition doc comment in types.go for why a fixed-offset
+// prefix read is safe without decoding the rest of this large message.
+func decodeSecurityDefinitionPrefix(buf []byte) (*SecurityDefinition, error) {
+	const symbolOffset = 4
+	const symbolLen = 25
+	const securityIDOffset = symbolOffset + symbolLen // 29
+	if len(buf) < securityIDOffset+4 {
+		return nil, fmt.Errorf("simba: SecurityDefinition body too short for the Symbol/SecurityID prefix")
+	}
+	var symbolRaw []byte = buf[symbolOffset : symbolOffset+symbolLen]
+	var end int = len(symbolRaw)
+	for end > 0 && (symbolRaw[end-1] == 0 || symbolRaw[end-1] == ' ') {
+		end--
+	}
+	return &SecurityDefinition{
+		Symbol:     string(symbolRaw[:end]),
+		SecurityID: int32(binary.LittleEndian.Uint32(buf[securityIDOffset : securityIDOffset+4])),
+	}, nil
+}
 
 func decodeOrderBookSnapshot(buf []byte, rootBlockLength uint16) (*OrderBookSnapshot, error) {
 	if len(buf) < int(rootBlockLength) || rootBlockLength < orderBookSnapshotRootSize {

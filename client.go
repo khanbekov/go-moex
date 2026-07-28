@@ -68,10 +68,10 @@ func (c *Client) Config() Config { return c.cfg }
 // Logger returns the current logger.
 func (c *Client) Logger() Logger { return c.logger }
 
-// registerCloser records a cleanup function to run on Client.Close(). Called
+// RegisterCloser records a cleanup function to run on Client.Close(). Called
 // by section sub-clients (forts.Client) once they lazily create a FIX
 // session or SIMBA listener.
-func (c *Client) registerCloser(fn func() error) {
+func (c *Client) RegisterCloser(fn func() error) {
 	c.closersMu.Lock()
 	defer c.closersMu.Unlock()
 	c.closers = append(c.closers, fn)
