@@ -57,7 +57,7 @@ type Client struct {
 	openOrders   map[int64]*types.OrderInfo
 	clOrdToOrder map[string]int64 // ClOrdID -> OrderID, once known.
 
-	orderWatchMu sync.Mutex
+	orderWatchMu  sync.Mutex
 	orderWatchers []chan *types.OrderInfo
 
 	positions *positionTracker
@@ -105,17 +105,17 @@ func NewClient(root *moex.Client) *Client {
 	var c *Client = &Client{
 		root:                 root,
 		cfg:                  cfg,
-		logger:                logger,
-		issClient:             issClient,
-		clOrdIDGen:            newClOrdIDGenerator("GM"),
-		orderCorrelator:       newCorrelator[*types.OrderInfo](),
-		cancelCorrelator:      newCorrelator[*types.OrderInfo](),
-		massCancelCorrelator:  newCorrelator[massCancelResult](),
-		openOrders:            make(map[int64]*types.OrderInfo),
-		clOrdToOrder:          make(map[string]int64),
-		positions:             newPositionTracker(),
-		engines:               make(map[int32]*orderbook.Engine),
-		symbolToSecurityID:    make(map[string]int32),
+		logger:               logger,
+		issClient:            issClient,
+		clOrdIDGen:           newClOrdIDGenerator("GM"),
+		orderCorrelator:      newCorrelator[*types.OrderInfo](),
+		cancelCorrelator:     newCorrelator[*types.OrderInfo](),
+		massCancelCorrelator: newCorrelator[massCancelResult](),
+		openOrders:           make(map[int64]*types.OrderInfo),
+		clOrdToOrder:         make(map[string]int64),
+		positions:            newPositionTracker(),
+		engines:              make(map[int32]*orderbook.Engine),
+		symbolToSecurityID:   make(map[string]int32),
 	}
 	c.market = &MarketDataClient{c: c}
 	c.trading = &TradingClient{c: c}

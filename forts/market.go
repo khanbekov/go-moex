@@ -29,23 +29,23 @@ import (
 	"github.com/shopspring/decimal"
 
 	moex "github.com/tonymontanov/go-moex"
-	rootTypes "github.com/tonymontanov/go-moex/types"
 	"github.com/tonymontanov/go-moex/forts/types"
 	"github.com/tonymontanov/go-moex/internal/iss"
+	rootTypes "github.com/tonymontanov/go-moex/types"
 )
 
 // MarketDataClient — FORTS reference data / candles / order book.
 type MarketDataClient struct{ c *Client }
 
 type issSecurityRow struct {
-	SecID           string  `iss:"SECID"`
-	ShortName       string  `iss:"SHORTNAME"`
-	Decimals        int32   `iss:"DECIMALS"`
-	MinStep         float64 `iss:"MINSTEP"`
-	LotVolume       int64   `iss:"LOTVOLUME"`
-	StepPrice       float64 `iss:"STEPPRICE"`
-	LastTradeDate   string  `iss:"LASTTRADEDATE"`
-	AssetCode       string  `iss:"ASSETCODE"`
+	SecID         string  `iss:"SECID"`
+	ShortName     string  `iss:"SHORTNAME"`
+	Decimals      int32   `iss:"DECIMALS"`
+	MinStep       float64 `iss:"MINSTEP"`
+	LotVolume     int64   `iss:"LOTVOLUME"`
+	StepPrice     float64 `iss:"STEPPRICE"`
+	LastTradeDate string  `iss:"LASTTRADEDATE"`
+	AssetCode     string  `iss:"ASSETCODE"`
 }
 
 const fortsSecuritiesPath = "/engines/futures/markets/forts/securities.json"

@@ -22,10 +22,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/shopspring/decimal"
 	moex "github.com/tonymontanov/go-moex"
 	"github.com/tonymontanov/go-moex/forts/types"
 	"github.com/tonymontanov/go-moex/internal/fix"
-	"github.com/shopspring/decimal"
 )
 
 // TradingClient — FORTS order entry.
@@ -33,9 +33,9 @@ type TradingClient struct{ c *Client }
 
 // massCancelResult — outcome of an Order Mass Cancel Request (§4.1.3/4.1.8).
 type massCancelResult struct {
-	Accepted             bool
-	TotalAffectedOrders  int64
-	RejectReasonText     string
+	Accepted            bool
+	TotalAffectedOrders int64
+	RejectReasonText    string
 }
 
 // CreateOrder sends a New Order Single and waits for the first Execution
