@@ -80,24 +80,73 @@ func (e *Engine) LoadSnapshot(entries []SnapshotEntry, seq uint64) {
 	e.haveLastSeq = true
 }
 
-// Clear empties the book without touching the sequence tracker (used when
-// the feed announces EmptyBook — the caller is expected to immediately
-// start feeding fresh ActionUpsert deltas per spec §4.1.2).
+// Clear empties the book AND resets the sequence tracker. Used when the
+// feed announces EmptyBook (spec §4.2.7/§4.2.8): the books are then
+// re-broadcast as unsequenced updates (seq 0, PossDupFlag) and the next
+// real update restarts the per-instrument numbering, so any remembered
+// sequence would only produce false gaps.
 func (e *Engine) Clear() {
 	e.orders = make(map[int64]orderState)
 	e.bidLevels = make(map[int64]int64)
 	e.askLevels = make(map[int64]int64)
 	e.haveBest_B = false
 	e.haveBest_A = false
+	e.haveLastSeq = false
+	e.lastSeq = 0
 }
 
-// ApplyDelta applies one incremental update. seq must be strictly
-// sequential (lastSeq+1); a gap returns ErrSequenceGap and leaves the book
-// untouched — the caller must resync (LoadSnapshot) before calling
-// ApplyDelta again, otherwise the book state is undefined.
-func (e *Engine) ApplyDelta(orderID int64, side Side, priceMantissa int64, size int64, action UpdateAction, seq uint64) error {
-	if e.haveLastSeq && seq != e.lastSeq+1 {
+// ResetSeq forgets the sequence tracker without touching the book (feed
+// SequenceReset: numbering restarts, books stay until EmptyBook).
+func (e *Engine) ResetSeq() {
+	e.haveLastSeq = false
+	e.lastSeq = 0
+}
+
+// checkSeq validates seq against the tracker without consuming it.
+// seq == 0 is "unsequenced" (SIMBA re-broadcasts after EmptyBook carry
+// RptSeq=0): always accepted, never tracked.
+func (e *Engine) checkSeq(seq uint64) error {
+	if seq == 0 || !e.haveLastSeq {
+		return nil
+	}
+	if seq <= e.lastSeq {
+		return ErrDuplicate
+	}
+	if seq != e.lastSeq+1 {
 		return ErrSequenceGap
+	}
+	return nil
+}
+
+func (e *Engine) commitSeq(seq uint64) {
+	if seq == 0 {
+		return
+	}
+	e.lastSeq = seq
+	e.haveLastSeq = true
+}
+
+// AdvanceSeq consumes seq without touching the book — for feed messages
+// that carry a sequence number but must not change the book (technical
+// trades with a null price, NonQuote/OTC records per spec §4.2.9).
+// Production feeds number those messages too; skipping them would make
+// the next real update look like a gap.
+func (e *Engine) AdvanceSeq(seq uint64) error {
+	if err := e.checkSeq(seq); err != nil {
+		return err
+	}
+	e.commitSeq(seq)
+	return nil
+}
+
+// ApplyDelta applies one incremental update. seq must be lastSeq+1 (or 0
+// for unsequenced updates): a duplicate returns ErrDuplicate, a gap
+// ErrSequenceGap, both leaving the book untouched — on a gap the caller
+// must resync (LoadSnapshot) before applying further deltas.
+// ErrUnknownOrder consumes seq (the update was valid on the feed).
+func (e *Engine) ApplyDelta(orderID int64, side Side, priceMantissa int64, size int64, action UpdateAction, seq uint64) error {
+	if err := e.checkSeq(seq); err != nil {
+		return err
 	}
 
 	switch action {
@@ -110,17 +159,23 @@ func (e *Engine) ApplyDelta(orderID int64, side Side, priceMantissa int64, size 
 	case ActionDelete:
 		old, ok := e.orders[orderID]
 		if !ok {
-			e.lastSeq = seq
-			e.haveLastSeq = true
+			e.commitSeq(seq)
 			return ErrUnknownOrder
 		}
 		delete(e.orders, orderID)
 		e.addToLevel(old.side, old.priceMantissa, -old.size)
 	}
 
-	e.lastSeq = seq
-	e.haveLastSeq = true
+	e.commitSeq(seq)
 	return nil
+}
+
+// ForEachOrder visits every resting order (unspecified order). For
+// diagnostics and oracle tests.
+func (e *Engine) ForEachOrder(fn func(orderID int64, side Side, priceMantissa int64, size int64)) {
+	for id, o := range e.orders {
+		fn(id, o.side, o.priceMantissa, o.size)
+	}
 }
 
 func (e *Engine) addToLevel(side Side, priceMantissa int64, delta int64) {

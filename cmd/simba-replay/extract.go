@@ -129,6 +129,15 @@ func runExtract(rd *pcap.Reader, opts runOptions, eo extractOptions) error {
 				dropped++
 				return nil
 			}
+			if newSeq, isReset := simba.SequenceResetIn(payload); isReset {
+				// Mirror the wire: the SequenceReset packet is numbered in the
+				// new sequence and the next packet carries NewSeqNo again; L
+				// values after it refer to the new numbering (new epoch).
+				incNewSeq = newSeq - 1
+				keptIncOldSeq = keptIncOldSeq[:0]
+				binary.LittleEndian.PutUint32(payload[0:4], newSeq)
+				return write(pkt, payload)
+			}
 			incNewSeq++
 			keptIncOldSeq = append(keptIncOldSeq, oldSeq)
 			binary.LittleEndian.PutUint32(payload[0:4], incNewSeq)

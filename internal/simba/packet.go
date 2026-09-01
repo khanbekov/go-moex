@@ -418,3 +418,21 @@ func (m Message) SecurityDefinition() (SecurityDefinitionPrefix, bool) {
 func (m Message) String() string {
 	return fmt.Sprintf("%s(template=%d v=%d block=%d body=%d)", m.Kind, m.Header.TemplateID, m.Header.Version, m.Header.BlockLength, len(m.body))
 }
+
+// SequenceResetIn reports whether the datagram carries a SequenceReset
+// message (a single-message packet on the wire) and its NewSeqNo. Cheap:
+// header parse plus one message header.
+func SequenceResetIn(buf []byte) (newSeqNo uint32, ok bool) {
+	var p Packet
+	var err error
+	p, err = ParsePacket(buf, 0)
+	if err != nil {
+		return 0, false
+	}
+	var m Message
+	m, ok, err = p.Next()
+	if err != nil || !ok {
+		return 0, false
+	}
+	return m.SequenceReset()
+}

@@ -19,6 +19,9 @@ Subcommands:
 	                             build books from snapshot + incrementals per spec §4.2.5
 	                             and compare against every later snapshot of the same
 	                             instrument (the correctness oracle for the real client)
+	session -pcap FILE [-max-instruments N]
+	                             drive the production forts.BookSession over the capture
+	                             and check it against every snapshot and BestPrices
 	extract -pcap FILE -sec ID[,ID] [-from 3s] [-to 20s] -out small.pcap
 	                             cut a self-consistent fixture for the chosen instruments
 
@@ -97,6 +100,8 @@ func main() {
 		err = runStats(src.Reader, opts)
 	case "verify":
 		err = runVerify(src.Reader, opts)
+	case "session":
+		err = runSession(src.Reader, opts)
 	case "extract":
 		var eo extractOptions
 		eo, err = parseExtractFlags(*secList, *from, *to, *out)
@@ -125,5 +130,5 @@ type runOptions struct {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: simba-replay {flows|stats|verify|extract} -pcap FILE [-inc GROUP:PORT] [-snap GROUP:PORT] [flags]")
+	fmt.Fprintln(os.Stderr, "usage: simba-replay {flows|stats|verify|session|extract} -pcap FILE [-inc GROUP:PORT] [-snap GROUP:PORT] [flags]")
 }

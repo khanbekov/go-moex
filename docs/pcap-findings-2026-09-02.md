@@ -118,9 +118,13 @@ FTP 22.06.2026, дампы от 15.05.2026; какая версия в прод�
 
 ### Техперерыв (суточный сброс, §4.2.7)
 
-Последовательность на проводе: `SequenceReset(NewSeqNo=1)` с
-`MsgSeqNum = 1` → `EmptyBook(LastMsgSeqNumProcessed = 0)` с
-`MsgSeqNum = 2`, `ExchangeTradingSessionID = null`, `TransactTime = 0` →
+Последовательность на проводе: `SequenceReset(NewSeqNo=1)` в пакете с
+`MsgSeqNum = 1` → `EmptyBook(LastMsgSeqNumProcessed = 0)` **тоже в пакете с
+`MsgSeqNum = 1`** (пакет SequenceReset нумерован уже в новой
+последовательности, а следующий за ним пакет несёт `NewSeqNo` ещё раз;
+после миллионных номеров клиент, проверяющий дубликаты до разбора
+сообщения, отбросит сам SequenceReset), `ExchangeTradingSessionID = null`,
+`TransactTime = 0` → дальше 2, 3, … →
 1989 пакетов OrderUpdate New с флагом **`PossDupFlag`** и **`LastFragment
 = 0`** (всё перевыставление — одна гигантская «транзакция», последний
 пакет с `LastFragment = 1`), 45 755 заявок по 2768 инструментам.
