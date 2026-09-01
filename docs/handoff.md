@@ -41,7 +41,21 @@ in code comments.
    in `internal/iss/table.go`, where ISS is inherently low-frequency).
    Hand-written FIX tag=value codec and SBE decoders instead of
    `quickfixgo` — see `internal/fix/message.go` and
-   `internal/simba/decode.go` doc comments for the rationale.
+   `internal/simba/packet.go` doc comments for the rationale. The SIMBA
+   hot-path API is `simba.ParsePacket` + `Packet.Next` + value-type
+   accessors (`Message.OrderUpdate()`, `Snapshot().Entry(i)`, ...):
+   zero heap allocations per packet, enforced by
+   `TestParsePacketZeroAlloc`. `DecodePacket`/`Decoded` (pointer fields,
+   first message only) are compatibility wrappers — do not use them in
+   new code.
+4. **Wire truth comes from pcap, not from the spec.** Every change to
+   `internal/simba`, `orderbook` or `forts/stream.go` must keep
+   `go test ./cmd/simba-replay/` green (reference model vs. production
+   fixtures) and should be re-run with `simba-replay verify` on the full
+   MOEX captures. See `docs/rework-plan-2026-09-02.md` (plan and defect
+   list) and `docs/pcap-findings-2026-09-02.md` (what the wire actually
+   does: multi-message packets, RptSeq semantics, snapshot cycles,
+   schema version 8 in production).
 
 ## 3. MOEX connectivity model (why there's no single REST+WS client)
 
@@ -69,10 +83,16 @@ FORTS gateway), **ASTS Bridge** / equities FIX Gate (v2.0, Shares).
   token-bucket limiter, passport cookie auth.
 - `internal/fix` — FIX 4.4 tag=value codec, TCP framing, session layer
   (Logon/Heartbeat/MsgSeqNum/ResendRequest, jittered reconnect backoff).
-- `internal/simba` — SBE decoders for Heartbeat/SequenceReset/BestPrices/
-  EmptyBook/OrderUpdate/OrderExecution/OrderBookSnapshot + a **partial**
+- `internal/simba` — allocation-free packet iterator (`ParsePacket`,
+  `Packet.Next`, `Message.*` accessors) over every SBE message of a
+  datagram, schema-version-aware template mapping (`Kind`; versions 8 and
+  9), strict header guards (MsgSize, SchemaID, Version); a **partial**
   SecurityDefinition decode (Symbol/SecurityID prefix only — see §6), UDP
-  multicast listener.
+  multicast listener. `Walk`/`DecodePacket` are tolerant wrappers for the
+  harness and v1.0 callers.
+- `internal/pcap` + `cmd/simba-replay` — offline harness over MOEX's
+  public production captures (flows/stats/verify/extract) and golden
+  fixtures in `internal/simba/testdata/`.
 - `orderbook` — protocol-agnostic L3 engine (per-order state + L2
   aggregation, sequence-gap detection), reusable by `shares/` in v2.0.
 - `forts/` — `Client` (lifecycle/Connect/Close), `TradingClient` (order

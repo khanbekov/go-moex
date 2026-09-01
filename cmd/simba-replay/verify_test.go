@@ -6,7 +6,7 @@ import (
 	"github.com/tonymontanov/go-moex/internal/pcap"
 )
 
-// The fixtures under testdata/ are cut from MOEX's public production
+// The fixtures under internal/simba/testdata/ are cut from MOEX's public production
 // captures (ftp.moex.com/pub/SIMBA/Spectra/prod/pcap/, 2026-05-15) with
 // `simba-replay extract`. The reference model must reproduce every
 // snapshot and every BestPrices message on them exactly — this is the
@@ -16,7 +16,7 @@ func openFixture(t *testing.T, name string) *pcap.Source {
 	t.Helper()
 	var src *pcap.Source
 	var err error
-	src, err = pcap.Open("testdata/"+name, "")
+	src, err = pcap.Open("../../internal/simba/testdata/"+name, "")
 	if err != nil {
 		t.Fatalf("open fixture %s: %v", name, err)
 	}

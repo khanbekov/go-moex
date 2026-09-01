@@ -44,6 +44,7 @@ func encodeOrderUpdatePacketForTest(t *testing.T, u simba.OrderUpdate) []byte {
 	body[48] = byte(u.MDUpdateAction)
 	body[49] = byte(u.MDEntryType)
 	buf = append(buf, body[:]...)
+	binary.LittleEndian.PutUint16(buf[4:6], uint16(len(buf))) // MsgSize — ParsePacket verifies it.
 
 	return buf
 }

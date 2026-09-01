@@ -96,9 +96,8 @@ type Decoded struct {
 }
 
 // DecodePacket parses one full UDP datagram payload and decodes its FIRST
-// SBE message. Kept for API compatibility with v1.0 callers; new code must
-// use Walk + DecodeMessage — an Incremental packet carries one or more
-// messages (spec §2.3.1) and this function drops all but the first.
+// SBE message into the pointer-based Decoded. Kept for v1.0 callers; hot
+// paths use ParsePacket/Packet.Next (no allocation, every message).
 func DecodePacket(buf []byte) (Decoded, error) {
 	var out Decoded
 	var first bool = true

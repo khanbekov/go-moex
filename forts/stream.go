@@ -82,18 +82,33 @@ func (mc *MarketDataClient) ResolveSecurityID(ctx context.Context, symbol string
 
 	var found int32 = -1
 	var runErr error = listener.Run(runCtx, func(buf []byte) {
-		var decoded simba.Decoded
-		var derr error
-		decoded, derr = simba.DecodePacket(buf)
-		if derr != nil || decoded.SecurityDefinition == nil {
+		var p simba.Packet
+		var perr error
+		p, perr = simba.ParsePacket(buf, 0)
+		if perr != nil {
 			return
 		}
-		mc.c.simbaMu.Lock()
-		mc.c.symbolToSecurityID[decoded.SecurityDefinition.Symbol] = decoded.SecurityDefinition.SecurityID
-		mc.c.simbaMu.Unlock()
-		if decoded.SecurityDefinition.Symbol == symbol {
-			found = decoded.SecurityDefinition.SecurityID
-			cancel()
+		for {
+			var m simba.Message
+			var ok bool
+			m, ok, perr = p.Next()
+			if perr != nil || !ok {
+				return
+			}
+			var sd simba.SecurityDefinitionPrefix
+			sd, ok = m.SecurityDefinition()
+			if !ok {
+				continue
+			}
+			var sym string = sd.SymbolString()
+			mc.c.simbaMu.Lock()
+			mc.c.symbolToSecurityID[sym] = sd.SecurityID
+			mc.c.simbaMu.Unlock()
+			if sym == symbol {
+				found = sd.SecurityID
+				cancel()
+				return
+			}
 		}
 	})
 	_ = runErr // context deadline/cancel is the expected exit path, not an error to surface.
@@ -150,34 +165,59 @@ func (mc *MarketDataClient) WatchOrderBook(ctx context.Context, securityID int32
 	return out, nil
 }
 
+// handleSIMBAPacket applies every message of one datagram that concerns
+// securityID to engine and calls onChange once if anything changed. An
+// Incremental packet carries one or more messages (spec §2.3.1; 68% of
+// production packets carry several) — all of them are processed, and
+// consumers are notified once per packet so a multi-order transaction is
+// not observed half-applied.
 func handleSIMBAPacket(buf []byte, securityID int32, engine *orderbook.Engine, onChange func()) {
-	var decoded simba.Decoded
+	var p simba.Packet
 	var err error
-	decoded, err = simba.DecodePacket(buf)
+	p, err = simba.ParsePacket(buf, 0)
 	if err != nil {
 		return
 	}
-
-	switch {
-	case decoded.OrderUpdate != nil && decoded.OrderUpdate.SecurityID == securityID:
-		var u *simba.OrderUpdate = decoded.OrderUpdate
-		applyOrderUpdateDelta(engine, u)
-		onChange()
-	case decoded.OrderExecution != nil && decoded.OrderExecution.SecurityID == securityID:
-		var e *simba.OrderExecution = decoded.OrderExecution
-		applyOrderExecutionDelta(engine, e)
-		onChange()
-	case decoded.OrderBookSnapshot != nil && decoded.OrderBookSnapshot.SecurityID == securityID:
-		loadOrderBookSnapshot(engine, decoded.OrderBookSnapshot)
-		onChange()
-	case decoded.EmptyBook != nil:
-		// EmptyBook carries no SecurityID (see simba.EmptyBook) — per spec
-		// §4.2.8 it applies to the instrument the CURRENT stream position
-		// concerns; v1.0 conservatively clears on every EmptyBook rather
-		// than risk clearing the wrong book. This is safe (worst case: an
-		// extra resync wait) but coarser than the spec allows — see
-		// docs/handoff.md.
-		engine.Clear()
+	var changed bool
+	for {
+		var m simba.Message
+		var ok bool
+		m, ok, err = p.Next()
+		if err != nil || !ok {
+			break
+		}
+		switch m.Kind {
+		case simba.KindOrderUpdate:
+			var u simba.OrderUpdate
+			u, ok = m.OrderUpdate()
+			if ok && u.SecurityID == securityID {
+				applyOrderUpdateDelta(engine, &u)
+				changed = true
+			}
+		case simba.KindOrderExecution:
+			var e simba.OrderExecution
+			e, ok = m.OrderExecution()
+			if ok && e.SecurityID == securityID {
+				applyOrderExecutionDelta(engine, &e)
+				changed = true
+			}
+		case simba.KindOrderBookSnapshot:
+			var v simba.SnapshotView
+			v, ok = m.Snapshot()
+			if ok && v.SecurityID == securityID {
+				loadOrderBookSnapshotView(engine, v)
+				changed = true
+			}
+		case simba.KindEmptyBook:
+			// EmptyBook carries no SecurityID: per spec §4.2.8 and production
+			// captures it is a global "clear every book" (daily reset /
+			// clearing), after which books are re-broadcast as OrderUpdate
+			// with PossDupFlag.
+			engine.Clear()
+			changed = true
+		}
+	}
+	if changed {
 		onChange()
 	}
 }
@@ -212,17 +252,29 @@ func applyOrderExecutionDelta(engine *orderbook.Engine, e *simba.OrderExecution)
 func loadOrderBookSnapshot(engine *orderbook.Engine, snap *simba.OrderBookSnapshot) {
 	var entries []orderbook.SnapshotEntry = make([]orderbook.SnapshotEntry, 0, len(snap.Entries))
 	for _, e := range snap.Entries {
-		if e.MDEntryType == simba.MDEntryTypeEmptyBook || e.MDEntryID == simba.NullInt64 {
-			continue
-		}
-		entries = append(entries, orderbook.SnapshotEntry{
-			OrderID:       e.MDEntryID,
-			Side:          sideFromMDEntryType(e.MDEntryType),
-			PriceMantissa: e.MDEntryPx,
-			Size:          e.MDEntrySize,
-		})
+		entries = appendSnapshotEntry(entries, e)
 	}
 	engine.LoadSnapshot(entries, uint64(snap.RptSeq))
+}
+
+func loadOrderBookSnapshotView(engine *orderbook.Engine, v simba.SnapshotView) {
+	var entries []orderbook.SnapshotEntry = make([]orderbook.SnapshotEntry, 0, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		entries = appendSnapshotEntry(entries, v.Entry(i))
+	}
+	engine.LoadSnapshot(entries, uint64(v.RptSeq))
+}
+
+func appendSnapshotEntry(entries []orderbook.SnapshotEntry, e simba.OrderBookSnapshotEntry) []orderbook.SnapshotEntry {
+	if e.MDEntryType == simba.MDEntryTypeEmptyBook || e.MDEntryID == simba.NullInt64 {
+		return entries
+	}
+	return append(entries, orderbook.SnapshotEntry{
+		OrderID:       e.MDEntryID,
+		Side:          sideFromMDEntryType(e.MDEntryType),
+		PriceMantissa: e.MDEntryPx,
+		Size:          e.MDEntrySize,
+	})
 }
 
 func sideFromMDEntryType(t simba.MDEntryType) orderbook.Side {

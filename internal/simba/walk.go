@@ -2,19 +2,14 @@
 FILE: internal/simba/walk.go
 
 DESCRIPTION:
-Iteration over the SBE messages inside one SIMBA packet. Spec §2.3.1: an
-Incremental packet carries "one or more SBE messages" (a Snapshot packet
-carries exactly one), and MOEX's reference PythonSimbaClient loops
-`while offset < len(data)` — so a decoder that reads only the first
-message silently drops the rest of every multi-order transaction.
+Callback-style wrappers over Packet for the offline harness
+(cmd/simba-replay) and for v1.0 callers of DecodePacket. Hot-path code
+uses Packet/Message from packet.go directly.
 
-To step from one message to the next the walker must know each template's
-wire "shape": root block (BlockLength from the SBE header) + repeating
-groups (groupSize/groupSize2 dimensions + blockLength × numInGroup) +
-trailing var-data fields (uint16 length + bytes). Shapes below are taken
-from simba_spectra-9.0.xml; templates with shapes the walker cannot size
-(DiscreteAuction: var-data nested inside a group) are only accepted as the
-last message of a packet.
+Walk is tolerant where ParsePacket is strict: it accepts a wrong MsgSize
+(synthetic test packets) and a truncated last message (reported through
+PacketInfo.Truncated) so that the harness can describe malformed traffic
+instead of stopping on it.
 */
 package simba
 
@@ -30,29 +25,9 @@ type templateShape struct {
 	unsizable bool  // shape has data nested inside a group; cannot be walked past.
 }
 
-var templateShapes = map[uint16]templateShape{
-	TemplateHeartbeat:                {},
-	TemplateSequenceReset:            {},
-	TemplateEmptyBook:                {},
-	TemplateBestPrices:               {groupDims: []int{3}},
-	TemplateOrderUpdate:              {},
-	TemplateOrderExecution:           {},
-	TemplateOrderBookSnapshot:        {groupDims: []int{3}},
-	TemplateSecurityDefinition:       {groupDims: []int{3, 3, 3, 3, 3}, varData: 2},
-	TemplateSecurityStatus:           {},
-	TemplateSecurityDefinitionUpdate: {},
-	TemplateTradingSessionStatus:     {},
-	TemplateDiscreteAuction:          {unsizable: true},
-	TemplateSecurityMassStatus:       {groupDims: []int{4}},
-	TemplateSecurityGroupStatus:      {},
-	TemplateLogon:                    {},
-	TemplateLogout:                   {},
-	TemplateMarketDataRequest:        {},
-	TemplateMarketDataDummyMessage:   {},
-}
-
-// Additional template IDs (schema 9) not decoded in v1.0 but needed to
-// walk FUT-INFO/OPT-INFO packets.
+// Template IDs of schema version 9 (simba_spectra-9.0.xml). Version 8
+// differs for SecurityDefinition (21) and SecurityStatus (9) — see
+// kindOf; hot-path code should switch on Message.Kind, not on these.
 const (
 	TemplateSecurityDefinitionUpdate uint16 = 10
 	TemplateSecurityMassStatus       uint16 = 19
@@ -66,48 +41,7 @@ const (
 	TemplateMarketDataDummyMessage   uint16 = 1003
 )
 
-// messageSize returns the number of body bytes (after the SBE header)
-// occupied by a message of template hdr.TemplateID, or -1 if unknown.
-func messageSize(hdr SBEHeader, body []byte) (int, error) {
-	var shape templateShape
-	var known bool
-	shape, known = templateShapes[hdr.TemplateID]
-	if !known || shape.unsizable {
-		return -1, nil
-	}
-	var off int = int(hdr.BlockLength)
-	if off > len(body) {
-		return 0, fmt.Errorf("simba: template %d root block %d exceeds body %d", hdr.TemplateID, hdr.BlockLength, len(body))
-	}
-	for gi, dim := range shape.groupDims {
-		if len(body) < off+dim {
-			return 0, fmt.Errorf("simba: template %d group %d dimensions truncated", hdr.TemplateID, gi)
-		}
-		var blockLen int = int(binary.LittleEndian.Uint16(body[off : off+2]))
-		var num int
-		if dim == 3 {
-			num = int(body[off+2])
-		} else {
-			num = int(binary.LittleEndian.Uint16(body[off+2 : off+4]))
-		}
-		off += dim + blockLen*num
-		if off > len(body) {
-			return 0, fmt.Errorf("simba: template %d group %d entries truncated", hdr.TemplateID, gi)
-		}
-	}
-	for vi := 0; vi < shape.varData; vi++ {
-		if len(body) < off+2 {
-			return 0, fmt.Errorf("simba: template %d var-data %d length truncated", hdr.TemplateID, vi)
-		}
-		off += 2 + int(binary.LittleEndian.Uint16(body[off:off+2]))
-		if off > len(body) {
-			return 0, fmt.Errorf("simba: template %d var-data %d truncated", hdr.TemplateID, vi)
-		}
-	}
-	return off, nil
-}
-
-// PacketInfo — the outer headers of one datagram.
+// PacketInfo — the outer headers of one datagram plus walk diagnostics.
 type PacketInfo struct {
 	Header      PacketHeader
 	Incremental IncrementalHeader // valid iff Header.IsIncremental().
@@ -119,12 +53,15 @@ type PacketInfo struct {
 	// own bounds checks. A harness should count these; a live feed should
 	// treat them as corruption.
 	Truncated bool
+	// Version — schema version of the messages (0 if none).
+	Version uint16
 }
 
 // Walk parses the packet headers of buf and calls fn for every SBE message
 // in order with its header and body (root block + groups + var-data, sized
-// per the schema; for an unsizable last message, body is the rest of the
-// packet). fn returns false to stop early. The body slices alias buf.
+// per the schema; for an unsizable/truncated last message, body is the
+// rest of the packet). fn returns false to stop early. Body slices alias
+// buf.
 func Walk(buf []byte, fn func(hdr SBEHeader, body []byte) bool) (PacketInfo, error) {
 	var info PacketInfo
 	var rest []byte
@@ -145,16 +82,17 @@ func Walk(buf []byte, fn func(hdr SBEHeader, body []byte) bool) (PacketInfo, err
 		if err != nil {
 			return info, err
 		}
+		if info.Version == 0 {
+			info.Version = hdr.Version
+		}
 		var size int
-		size, err = messageSize(hdr, rest)
+		size, err = messageSizeKind(kindOf(hdr.Version, hdr.TemplateID), hdr.BlockLength, rest)
 		if err != nil {
 			info.Truncated = true
 			size = -1
 		}
 		var body []byte
 		if size < 0 {
-			// Unsizable (or truncated) message: it takes the rest of the
-			// packet and must be the last one.
 			body = rest
 			rest = nil
 		} else {
@@ -180,30 +118,69 @@ func PacketHeaderSeq(buf []byte) uint32 {
 
 // DecodeMessage decodes one SBE message (as delivered by Walk) into the
 // typed payload fields of Decoded. Headers in out are left untouched.
+// Allocates (pointer fields); harness/compat use only.
 func DecodeMessage(hdr SBEHeader, body []byte, out *Decoded) error {
-	var err error
-	switch hdr.TemplateID {
-	case TemplateHeartbeat:
-	case TemplateSequenceReset:
-		if len(body) < 4 {
+	var m Message = Message{Header: hdr, Kind: kindOf(hdr.Version, hdr.TemplateID), body: body}
+	switch m.Kind {
+	case KindHeartbeat:
+	case KindSequenceReset:
+		var v uint32
+		var ok bool
+		v, ok = m.SequenceReset()
+		if !ok {
 			return fmt.Errorf("simba: SequenceReset body too short")
 		}
-		var v uint32 = binary.LittleEndian.Uint32(body[0:4])
 		out.NewSeqNo = &v
-	case TemplateBestPrices:
-		out.BestPrices, err = decodeBestPrices(body, hdr.BlockLength)
-	case TemplateEmptyBook:
-		out.EmptyBook, err = decodeEmptyBook(body)
-	case TemplateOrderUpdate:
-		out.OrderUpdate, err = decodeOrderUpdate(body)
-	case TemplateOrderExecution:
-		out.OrderExecution, err = decodeOrderExecution(body)
-	case TemplateOrderBookSnapshot:
-		out.OrderBookSnapshot, err = decodeOrderBookSnapshot(body, hdr.BlockLength)
-	case TemplateSecurityDefinition:
-		out.SecurityDefinition, err = decodeSecurityDefinitionPrefix(body)
+	case KindBestPrices:
+		var bp *BestPrices
+		var err error
+		bp, err = decodeBestPrices(body, hdr.BlockLength)
+		if err != nil {
+			return err
+		}
+		out.BestPrices = bp
+	case KindEmptyBook:
+		var eb *EmptyBook
+		var err error
+		eb, err = decodeEmptyBook(body)
+		if err != nil {
+			return err
+		}
+		out.EmptyBook = eb
+	case KindOrderUpdate:
+		var ou *OrderUpdate
+		var err error
+		ou, err = decodeOrderUpdate(body)
+		if err != nil {
+			return err
+		}
+		out.OrderUpdate = ou
+	case KindOrderExecution:
+		var oe *OrderExecution
+		var err error
+		oe, err = decodeOrderExecution(body)
+		if err != nil {
+			return err
+		}
+		out.OrderExecution = oe
+	case KindOrderBookSnapshot:
+		var obs *OrderBookSnapshot
+		var err error
+		obs, err = decodeOrderBookSnapshot(body, hdr.BlockLength)
+		if err != nil {
+			return err
+		}
+		out.OrderBookSnapshot = obs
+	case KindSecurityDefinition:
+		var sd *SecurityDefinition
+		var err error
+		sd, err = decodeSecurityDefinitionPrefix(body)
+		if err != nil {
+			return err
+		}
+		out.SecurityDefinition = sd
 	default:
-		// Unknown/unsupported template — not an error, just not decoded.
+		// Unknown/unsupported kind — not an error, just not decoded.
 	}
-	return err
+	return nil
 }

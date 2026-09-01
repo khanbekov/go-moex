@@ -180,7 +180,7 @@ go test ./cmd/simba-replay/   # golden-тест оракула на testdata/*.p
 «primary» (A) из `configuration.xml`; для других контуров задавать `-inc`
 и `-snap`.
 
-Фикстуры в `cmd/simba-replay/testdata/` вырезаны командой `extract`:
+Фикстуры в `internal/simba/testdata/` вырезаны командой `extract`:
 `main-session-2instr` (инструменты 7299709 и 3416766, 3 снапшот-цикла,
 13 транзакций со сделками) и `tech-break-2instr` (SequenceReset,
 EmptyBook, перевыставление, 4 цикла). При вырезании `MsgSeqNum`
