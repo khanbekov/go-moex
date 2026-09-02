@@ -142,7 +142,8 @@ type BookSession struct {
 
 	mu             sync.Mutex
 	books          map[int32]*instrumentBook
-	collecting     int // number of instruments in BookCollecting.
+	changed        []*instrumentBook // books touched by the packet being processed (hot path: no full scan).
+	collecting     int               // number of instruments in BookCollecting.
 	afterEmptyBook bool
 	// lossWindow — packets were declared lost: instruments whose only
 	// updates were in the lost range cannot notice (their RptSeq never
@@ -178,7 +179,7 @@ func NewBookSession(cfg BookSessionConfig) *BookSession {
 	if cfg.Feed.Replayer == nil && cfg.SIMBA.ReplayHost != "" {
 		cfg.Feed.Replayer = &simba.ReplayClient{Addr: cfg.SIMBA.ReplayHost}
 	}
-	var s *BookSession = &BookSession{cfg: cfg, logger: logger, books: make(map[int32]*instrumentBook)}
+	var s *BookSession = &BookSession{cfg: cfg, logger: logger, books: make(map[int32]*instrumentBook), changed: make([]*instrumentBook, 0, 64)}
 	s.feedInit()
 	s.metrics = newSessionMetrics(cfg.Metrics)
 	return s
@@ -477,13 +478,15 @@ func (s *BookSession) applyLocked(b *instrumentBook, d *bufferedDelta) {
 	}
 	switch {
 	case err == nil:
-		b.changed = !filtered
+		if !filtered {
+			s.markChanged(b)
+		}
 	case errors.Is(err, orderbook.ErrDuplicate):
 		s.stats.DuplicateUpdates++
 	case errors.Is(err, orderbook.ErrUnknownOrder):
 		s.stats.UnknownOrders++
 		s.metricInc(s.metrics.unknownOrders)
-		b.changed = true
+		s.markChanged(b)
 		s.logger.Warn("forts: update for unknown order — book may be out of sync", moex.Int("security_id", int64(b.id)), moex.Int("order_id", d.id), moex.Int("rpt_seq", int64(d.rpt)))
 	case errors.Is(err, orderbook.ErrSequenceGap):
 		var last uint64
@@ -507,7 +510,7 @@ func (s *BookSession) toCollectingLocked(b *instrumentBook) {
 	b.pending = b.pending[:0]
 	b.overflow = false
 	b.asm = snapshotAssembler{}
-	b.changed = true
+	s.markChanged(b)
 	s.collecting++
 	s.ensureSnapshotListenerLocked()
 	if s.cfg.OnState != nil {
@@ -523,7 +526,7 @@ func (s *BookSession) toLiveLocked(b *instrumentBook) {
 	b.pending = b.pending[:0]
 	b.overflow = false
 	b.asm = snapshotAssembler{}
-	b.changed = true
+	s.markChanged(b)
 	b.syncCount++
 	s.collecting--
 	if s.collecting == 0 && !s.lossWindow {
@@ -552,23 +555,27 @@ func (s *BookSession) onEmptyBook() {
 		if b.state == BookCollecting {
 			s.toLiveLocked(b)
 		}
+		s.markChanged(b)
+	}
+}
+
+// markChanged records b for the end-of-packet notification (once).
+func (s *BookSession) markChanged(b *instrumentBook) {
+	if !b.changed {
 		b.changed = true
+		s.changed = append(s.changed, b)
 	}
 }
 
 func (s *BookSession) notifyChangedLocked() {
-	if s.cfg.OnBook == nil {
-		for _, b := range s.books {
-			b.changed = false
-		}
-		return
-	}
-	for _, b := range s.books {
-		if b.changed {
-			b.changed = false
+	for i, b := range s.changed {
+		b.changed = false
+		s.changed[i] = nil
+		if s.cfg.OnBook != nil {
 			s.cfg.OnBook(b.id, b.engine)
 		}
 	}
+	s.changed = s.changed[:0]
 }
 
 // HandleSnapshotPacket processes one Snapshot-feed datagram. Exposed for
@@ -677,7 +684,7 @@ func (s *BookSession) completeSnapshotLocked(b *instrumentBook) {
 		last, ok = b.engine.LastSeq()
 		if a.R != 0 && (!ok || last < uint64(a.R)) {
 			b.engine.LoadSnapshot(a.entries, uint64(a.R))
-			b.changed = true
+			s.markChanged(b)
 			s.stats.SnapshotRepairs++
 			s.logger.Warn("forts: live book repaired from snapshot after packet loss", moex.Int("security_id", int64(b.id)), moex.Int("book_rpt", int64(last)), moex.Int("snapshot_rpt", int64(a.R)))
 		}
@@ -703,7 +710,7 @@ func (s *BookSession) completeSnapshotLocked(b *instrumentBook) {
 			return // gap while replaying the buffer: back to Collecting.
 		}
 	}
-	b.changed = true
+	s.markChanged(b)
 }
 
 // SIMBA MDFlags bits used here (MDFlagsSet in simba_spectra-9.0.xml).

@@ -203,17 +203,16 @@ forgotten between sessions.
   startup. This is a hard external-data-source limitation, not something
   more code can fix without a Plaza II clearing feed or broker EOD report
   integration (out of scope for v1.0).
-- **`orderbook.Engine.Levels(n)` is O(levels log levels) per call** (sorts
-  a map on every invocation). Fine for FORTS book depth; would need a
-  sorted structure (skip list / red-black tree) if profiling shows this
-  hot on a high-depth, high-frequency `WatchOrderBook` consumer. Public
-  API is stable either way.
+- **`orderbook.Engine` keeps price levels in two sorted slices** (stage 4):
+  top of book is O(1), `TopN(side, n, dst)` copies into the caller's buffer
+  without allocating, a new/emptied level costs a memmove of the side's
+  levels (hundreds of entries on FORTS). `Levels(n)` allocates a fresh
+  slice — convenience for non-hot callers.
 - **`Engine` is not internally synchronized** — callers must serialize
-  `ApplyDelta`/`LoadSnapshot`/`Clear` calls per instrument. Satisfied
-  naturally today because `forts/stream.go` runs one `Engine` per
-  `SecurityID`, fed by a single dispatch path (the SIMBA listener's read
-  goroutine) — do not start calling `Engine` methods from multiple
-  goroutines without adding your own locking.
+  `ApplyDelta`/`LoadSnapshot`/`Clear` calls per instrument.
+  `forts.BookSession` holds one mutex over all its books and invokes
+  `OnBook` under it; read engines only from that callback (or under your
+  own synchronisation with it).
 - **One SIMBA multicast interface (`NetworkInterface`) shared by every
   `Listen` call** — fine for a single-NIC colocation host; a multi-circuit
   redundant setup would need per-group interface selection, not modeled
