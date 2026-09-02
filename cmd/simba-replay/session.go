@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
+	"time"
 
 	"github.com/tonymontanov/go-moex/forts"
 	"github.com/tonymontanov/go-moex/internal/pcap"
@@ -48,7 +51,49 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 	}
 	fmt.Printf("loaded incremental=%d snapshot=%d packets\n", len(inc), len(snap))
 
-	var session *forts.BookSession = forts.NewBookSession(forts.BookSessionConfig{})
+	var rng *rand.Rand = rand.New(rand.NewSource(opts.seed))
+	var feedCfg forts.FeedConfig = forts.FeedConfig{GapTimeout: 5 * time.Millisecond}
+	var replayer *captureReplayer
+	if opts.replay {
+		replayer = &captureReplayer{packets: make(map[uint32][]byte, len(inc))}
+		for _, fp := range inc {
+			replayer.packets[fp.seq] = fp.payload
+		}
+		feedCfg.Replayer = replayer
+	}
+	var session *forts.BookSession = forts.NewBookSession(forts.BookSessionConfig{Feed: feedCfg})
+	// deliver hands one incremental datagram to the session through the
+	// simulated legs: each leg drops it with probability opts.loss; with
+	// -ab the packet is offered twice in random order.
+	var dropped, offered int
+	var droppedSeqs map[uint32]bool = make(map[uint32]bool) // lost on every leg
+	var deliver = func(payload []byte) {
+		var legs int = 1
+		if opts.ab {
+			legs = 2
+		}
+		var sent int
+		for i := 0; i < legs; i++ {
+			offered++
+			if opts.loss > 0 && rng.Float64() < opts.loss {
+				dropped++
+				continue
+			}
+			session.HandleIncrementalPacket(payload)
+			sent++
+		}
+		if sent == 0 && legs > 0 && opts.loss > 0 {
+			droppedSeqs[simba.PacketHeaderSeq(payload)] = true
+		}
+	}
+	// settle waits until the feed layer has nothing held back (gap timers
+	// and replays have run), so the engine is exactly at the delivered seq.
+	var settle = func() {
+		var deadline time.Time = time.Now().Add(5 * time.Second)
+		for session.FeedPending() > 0 && time.Now().Before(deadline) {
+			time.Sleep(200 * time.Microsecond)
+		}
+	}
 	var engines map[int32]*orderbook.Engine = make(map[int32]*orderbook.Engine)
 	var engineOf = func(sec int32) *orderbook.Engine {
 		var e *orderbook.Engine = engines[sec]
@@ -70,7 +115,17 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 
 	var next int
 	var pendingBP map[int32]bpExpect = make(map[int32]bpExpect)
-	var bpChecks, bpMism, compares, mismatches, deferred int
+	var bpChecks, bpMism, compares, mismatches, deferred, unverifiable int
+	// caughtUp reports whether the session has processed every packet up
+	// to and including seq. With simulated loss a dropped packet is only
+	// detectable once a later one arrives, which lazy delivery withholds —
+	// comparing then would blame the session for an unknowable gap.
+	var caughtUp = func(seq uint32) bool {
+		var exp uint32
+		var ok bool
+		exp, ok = session.FeedExpected()
+		return ok && exp == seq+1
+	}
 	var examples int
 	var deliverInc = func(upTo uint32) {
 		for next < len(inc) && (upTo == 0 || inc[next].seq <= upTo) {
@@ -110,9 +165,21 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 					}
 				}
 			}
-			session.HandleIncrementalPacket(inc[next].payload)
+			deliver(inc[next].payload)
 			next++
 			if !eot {
+				continue
+			}
+			if opts.loss > 0 {
+				settle()
+			}
+			if !caughtUp(inc[next-1].seq) {
+				// Expectations of transactions we cannot verify must not
+				// leak into later checks.
+				for sec := range pendingBP {
+					delete(pendingBP, sec)
+				}
+				unverifiable++
 				continue
 			}
 			for sec, e := range pendingBP {
@@ -123,6 +190,22 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 				}
 				if st, _ := session.State(sec); st != forts.BookLive {
 					continue
+				}
+				if !opts.replay {
+					// Without replay a packet lost on every leg is gone; an
+					// instrument whose only update of this transaction was in
+					// it cannot know yet (no later RptSeq to jump) — the
+					// snapshot repair fixes it a cycle later. Not verifiable here.
+					var lost bool
+					for q := e.msgSeq; q <= inc[next-1].seq; q++ {
+						if droppedSeqs[q] {
+							lost = true
+						}
+					}
+					if lost {
+						unverifiable++
+						continue
+					}
 				}
 				bpChecks++
 				var bidPx, bidSize, askPx, askSize int64
@@ -142,8 +225,25 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 					bpMism++
 					if examples < opts.examples || opts.verbose {
 						examples++
-						fmt.Printf("[BestPrices mismatch] sec=%d bpSeq=%d eotSeq=%d expected bid=%d/%d ask=%d/%d  engine bid=%d/%d(%v) ask=%d/%d(%v)\n",
-							sec, e.msgSeq, inc[next-1].seq, e.bidPx, e.bidSize, e.askPx, e.askSize, bidPx, bidSize, haveBid, askPx, askSize, haveAsk)
+						var lost []uint32
+						var lastRpt uint32
+						for q := e.msgSeq; q <= inc[next-1].seq; q++ {
+							if droppedSeqs[q] {
+								lost = append(lost, q)
+							}
+						}
+						// RptSeq of the last message for sec in the transaction's packets.
+						for k := next - 1; k >= 0 && inc[k].seq >= e.msgSeq; k-- {
+							lastRpt = lastRptFor(inc[k].payload, sec)
+							if lastRpt != 0 {
+								break
+							}
+						}
+						var engSeq, _ = engine.LastSeq()
+						var expSeq, _ = session.FeedExpected()
+						fmt.Printf("    engine rpt=%d wire last rpt=%d feed expected=%d state=%v\n", engSeq, lastRpt, expSeq, func() forts.BookState { st, _ := session.State(sec); return st }())
+						fmt.Printf("[BestPrices mismatch] sec=%d bpSeq=%d eotSeq=%d dropped=%v expected bid=%d/%d ask=%d/%d  engine bid=%d/%d(%v) ask=%d/%d(%v)\n",
+							sec, e.msgSeq, inc[next-1].seq, lost, e.bidPx, e.bidSize, e.askPx, e.askSize, bidPx, bidSize, haveBid, askPx, askSize, haveAsk)
 					}
 				}
 			}
@@ -178,6 +278,9 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 			continue
 		}
 		deliverInc(v.LastMsgSeqNumProcessed)
+		if opts.loss > 0 {
+			settle()
+		}
 		if hdr.IsStartOfSnapshot() {
 			var st forts.BookState
 			st, _ = session.State(v.SecurityID)
@@ -201,6 +304,10 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 		}
 		delete(partial, v.SecurityID)
 		if !wasLive[v.SecurityID] {
+			continue
+		}
+		if !caughtUp(ps.L) {
+			unverifiable++
 			continue
 		}
 		compares++
@@ -234,6 +341,7 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 		}
 	}
 	deliverInc(0)
+	settle()
 
 	var live, empty int
 	for sec, e := range engines {
@@ -245,8 +353,14 @@ func runSession(rd *pcap.Reader, opts runOptions) error {
 		}
 	}
 	fmt.Println("\n== production BookSession ==")
+	if opts.ab || opts.loss > 0 {
+		fmt.Printf("simulation: legs=%d loss=%.4f offered=%d dropped=%d replay=%v\n", map[bool]int{false: 1, true: 2}[opts.ab], opts.loss, offered, dropped, opts.replay)
+	}
+	if replayer != nil {
+		fmt.Printf("capture replayer: requests=%d packets_served=%d\n", replayer.requests, replayer.served)
+	}
 	fmt.Printf("instruments=%d live=%d empty_books=%d\n", len(engines), live, empty)
-	fmt.Printf("snapshot oracle: compares=%d mismatches=%d skipped_older_than_capture=%d\n", compares, mismatches, deferred)
+	fmt.Printf("snapshot oracle: compares=%d mismatches=%d skipped_older_than_capture=%d unverifiable(session not caught up at L)=%d\n", compares, mismatches, deferred, unverifiable)
 	fmt.Printf("bestprices oracle: checks=%d mismatches=%d\n", bpChecks, bpMism)
 	fmt.Printf("session stats: %s\n", session.Stats())
 	if mismatches != 0 || bpMism != 0 {
@@ -276,4 +390,52 @@ func snapshotView(payload []byte) (simba.PacketHeader, simba.SnapshotView, bool)
 	var v simba.SnapshotView
 	v, ok = m.Snapshot()
 	return p.Header(), v, ok
+}
+
+// captureReplayer serves TCP-replay requests from the capture (stands in
+// for the exchange's Replay service in offline runs).
+type captureReplayer struct {
+	packets  map[uint32][]byte
+	requests int
+	served   int
+}
+
+func (r *captureReplayer) Replay(ctx context.Context, beg, end uint32, h func([]byte)) (simba.ReplayResult, error) {
+	r.requests++
+	var res simba.ReplayResult
+	for seq := beg; seq <= end; seq++ {
+		if p, ok := r.packets[seq]; ok {
+			h(p)
+			res.Packets++
+			r.served++
+		}
+	}
+	return res, nil
+}
+
+// lastRptFor returns the RptSeq of the last OrderUpdate/OrderExecution
+// for sec in the packet (0 if none).
+func lastRptFor(payload []byte, sec int32) uint32 {
+	var p simba.Packet
+	var err error
+	p, err = simba.ParsePacket(payload, 0)
+	if err != nil {
+		return 0
+	}
+	var last uint32
+	for {
+		var m simba.Message
+		var ok bool
+		m, ok, err = p.Next()
+		if err != nil || !ok {
+			break
+		}
+		if u, ok := m.OrderUpdate(); ok && u.SecurityID == sec {
+			last = u.RptSeq
+		}
+		if e, ok := m.OrderExecution(); ok && e.SecurityID == sec {
+			last = e.RptSeq
+		}
+	}
+	return last
 }

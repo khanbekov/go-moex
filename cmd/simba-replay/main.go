@@ -19,9 +19,11 @@ Subcommands:
 	                             build books from snapshot + incrementals per spec §4.2.5
 	                             and compare against every later snapshot of the same
 	                             instrument (the correctness oracle for the real client)
-	session -pcap FILE [-max-instruments N]
+	session -pcap FILE [-max-instruments N] [-ab] [-loss P] [-replay] [-seed S]
 	                             drive the production forts.BookSession over the capture
-	                             and check it against every snapshot and BestPrices
+	                             and check it against every snapshot and BestPrices;
+	                             -ab/-loss/-replay simulate redundant legs, packet loss
+	                             and TCP replay served from the capture
 	extract -pcap FILE -sec ID[,ID] [-from 3s] [-to 20s] -out small.pcap
 	                             cut a self-consistent fixture for the chosen instruments
 
@@ -67,6 +69,10 @@ func main() {
 	var from *string = fs.String("from", "", "extract: window start as offset from the first packet (e.g. 3s)")
 	var to *string = fs.String("to", "", "extract: window end as offset from the first packet (e.g. 20s)")
 	var out *string = fs.String("out", "", "extract: output .pcap path")
+	var ab *bool = fs.Bool("ab", false, "session: feed every incremental packet through two legs (A/B) with random ordering")
+	var loss *float64 = fs.Float64("loss", 0, "session: independent per-leg packet loss probability (0..1); with -ab correlated loss is loss^2")
+	var replay *bool = fs.Bool("replay", false, "session: serve TCP-replay requests from the capture itself")
+	var seed *int64 = fs.Int64("seed", 1, "session: RNG seed for -ab/-loss")
 	_ = fs.Parse(os.Args[2:])
 	if *pcapPath == "" {
 		usage()
@@ -91,6 +97,10 @@ func main() {
 		maxPackets: *maxPackets,
 		verbose:    *verbose,
 		examples:   *examples,
+		ab:         *ab,
+		loss:       *loss,
+		replay:     *replay,
+		seed:       *seed,
 	}
 	var started time.Time = time.Now()
 	switch sub {
@@ -127,6 +137,10 @@ type runOptions struct {
 	maxPackets      uint64
 	verbose         bool
 	examples        int
+	ab              bool
+	loss            float64
+	replay          bool
+	seed            int64
 }
 
 func usage() {

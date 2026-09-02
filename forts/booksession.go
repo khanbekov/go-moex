@@ -80,6 +80,11 @@ type BookSessionConfig struct {
 	OnBook func(securityID int32, engine *orderbook.Engine)
 	// OnState — called on Collecting<->Live transitions.
 	OnState func(securityID int32, state BookState)
+	// Feed — A/B merge, reordering and replay recovery knobs.
+	Feed FeedConfig
+	// Metrics — counter factory (nil = no metrics). Counter names are
+	// moex_simba_*_total.
+	Metrics moex.CounterFactory
 	Logger  moex.Logger
 }
 
@@ -95,7 +100,9 @@ type BookSessionStats struct {
 	BufferOverflows                                uint64
 	SnapshotsDeferred                              uint64 // completed snapshots not usable (L outside the buffered window).
 	SnapshotsDiscarded                             uint64 // partial snapshots dropped (gap/cycle restart).
+	SnapshotRepairs                                uint64 // live books reloaded from a snapshot whose RptSeq was ahead (silent loss).
 	EmptyBooks, SequenceResets                     uint64
+	Replays, ReplayFailures, ReplayedPackets       uint64
 }
 
 type bufferedDelta struct {
@@ -137,13 +144,20 @@ type BookSession struct {
 	books          map[int32]*instrumentBook
 	collecting     int // number of instruments in BookCollecting.
 	afterEmptyBook bool
+	// lossWindow — packets were declared lost: instruments whose only
+	// updates were in the lost range cannot notice (their RptSeq never
+	// jumps), so the Snapshot feed is kept for a full cycle and any live
+	// book whose RptSeq lags a snapshot's is reloaded from it (spec §4.2.5:
+	// "RptSeq gaps show the exact instruments affected").
+	lossWindow       bool
+	lossWindowCycles int
 
-	incHave  bool
-	incLast  uint32
 	snapHave bool
 	snapLast uint32
 
-	stats BookSessionStats
+	stats   BookSessionStats
+	feed    feedState
+	metrics sessionMetrics
 
 	// snapshot listener lifecycle (nil when not running).
 	snapCancel context.CancelFunc
@@ -161,7 +175,41 @@ func NewBookSession(cfg BookSessionConfig) *BookSession {
 	if logger == nil {
 		logger = moex.NoopLogger()
 	}
-	return &BookSession{cfg: cfg, logger: logger, books: make(map[int32]*instrumentBook)}
+	if cfg.Feed.Replayer == nil && cfg.SIMBA.ReplayHost != "" {
+		cfg.Feed.Replayer = &simba.ReplayClient{Addr: cfg.SIMBA.ReplayHost}
+	}
+	var s *BookSession = &BookSession{cfg: cfg, logger: logger, books: make(map[int32]*instrumentBook)}
+	s.feedInit()
+	s.metrics = newSessionMetrics(cfg.Metrics)
+	return s
+}
+
+// sessionMetrics — counters mirrored from BookSessionStats.
+type sessionMetrics struct {
+	packets, gaps, dups, replays, replayFailures, syncs, resyncs, unknownOrders, parseErrors moex.Counter
+}
+
+func newSessionMetrics(f moex.CounterFactory) sessionMetrics {
+	if f == nil {
+		return sessionMetrics{}
+	}
+	return sessionMetrics{
+		packets:        f.Counter("moex_simba_inc_packets_total"),
+		gaps:           f.Counter("moex_simba_inc_gaps_total"),
+		dups:           f.Counter("moex_simba_inc_duplicates_total"),
+		replays:        f.Counter("moex_simba_replays_total"),
+		replayFailures: f.Counter("moex_simba_replay_failures_total"),
+		syncs:          f.Counter("moex_simba_book_syncs_total"),
+		resyncs:        f.Counter("moex_simba_book_resyncs_total"),
+		unknownOrders:  f.Counter("moex_simba_unknown_orders_total"),
+		parseErrors:    f.Counter("moex_simba_parse_errors_total"),
+	}
+}
+
+func (s *BookSession) metricInc(c moex.Counter) {
+	if c != nil {
+		c.Inc()
+	}
 }
 
 // Subscribe starts maintaining the book of securityID. Safe before or
@@ -218,22 +266,47 @@ func (s *BookSession) Stats() BookSessionStats {
 	return s.stats
 }
 
-// Run joins the Incremental feed and serves until ctx is done. The
-// Snapshot feed is joined on demand (while any instrument is Collecting).
+// Run joins the Incremental feed (legs A and B when both are configured)
+// and serves until ctx is done. The Snapshot feed is joined on demand
+// (while any instrument is Collecting).
 func (s *BookSession) Run(ctx context.Context) error {
 	if s.cfg.SIMBA.IncrementalGroupA == "" || s.cfg.SIMBA.SnapshotGroupA == "" {
 		return moex.NewError(moex.TransportSIMBA, moex.ErrorKindInvalidRequest, "", "forts: Config.SIMBA.IncrementalGroupA and SnapshotGroupA are required for BookSession", nil)
 	}
-	var inc *simba.Listener
-	var err error
-	inc, err = simba.Listen(simba.ListenerConfig{GroupAddr: s.cfg.SIMBA.IncrementalGroupA, Interface: s.cfg.SIMBA.NetworkInterface, Logger: s.logger})
-	if err != nil {
-		return moex.NewError(moex.TransportSIMBA, moex.ErrorKindNetwork, "", "forts: join Incremental multicast group", err)
+	var legs []*simba.Listener
+	var closeLegs = func() {
+		for _, l := range legs {
+			_ = l.Close()
+		}
 	}
-	defer inc.Close()
+	var listen = func(group, source string) error {
+		var l *simba.Listener
+		var err error
+		l, err = simba.Listen(simba.ListenerConfig{GroupAddr: group, SourceIP: source, Interface: s.cfg.SIMBA.NetworkInterface, Logger: s.logger})
+		if err != nil {
+			return moex.NewError(moex.TransportSIMBA, moex.ErrorKindNetwork, "", "forts: Incremental multicast group "+group, err)
+		}
+		legs = append(legs, l)
+		return nil
+	}
+	if err := listen(s.cfg.SIMBA.IncrementalGroupA, s.cfg.SIMBA.SourceIPA); err != nil {
+		return err
+	}
+	if s.cfg.SIMBA.IncrementalGroupB != "" {
+		if err := listen(s.cfg.SIMBA.IncrementalGroupB, s.cfg.SIMBA.SourceIPB); err != nil {
+			closeLegs()
+			return err
+		}
+	}
+	defer closeLegs()
+
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	runCtx, cancel = context.WithCancel(ctx)
+	defer cancel()
 
 	s.mu.Lock()
-	s.runCtx = ctx
+	s.runCtx = runCtx
 	s.running.Store(true)
 	s.ensureSnapshotListenerLocked()
 	s.mu.Unlock()
@@ -241,11 +314,20 @@ func (s *BookSession) Run(ctx context.Context) error {
 		s.mu.Lock()
 		s.running.Store(false)
 		s.stopSnapshotListenerLocked()
+		s.feedResetLocked()
 		s.mu.Unlock()
 	}()
 
-	err = inc.Run(ctx, s.HandleIncrementalPacket)
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	var errCh chan error = make(chan error, len(legs))
+	for _, l := range legs {
+		go func(l *simba.Listener) { errCh <- l.Run(runCtx, s.HandleIncrementalPacket) }(l)
+	}
+	var err error = <-errCh // first leg to stop ends the session (both stop on ctx).
+	cancel()
+	for i := 1; i < len(legs); i++ {
+		<-errCh
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 		return nil
 	}
 	return err
@@ -254,30 +336,49 @@ func (s *BookSession) Run(ctx context.Context) error {
 // ensureSnapshotListenerLocked starts the snapshot listener if the
 // session is running, any instrument is Collecting and it is not up yet.
 func (s *BookSession) ensureSnapshotListenerLocked() {
-	if !s.running.Load() || s.collecting == 0 || s.snapCancel != nil {
+	if !s.running.Load() || (s.collecting == 0 && !s.lossWindow) || s.snapCancel != nil {
 		return
 	}
 	var ctx context.Context
 	var cancel context.CancelFunc
 	ctx, cancel = context.WithCancel(s.runCtx)
-	var l *simba.Listener
-	var err error
-	l, err = simba.Listen(simba.ListenerConfig{GroupAddr: s.cfg.SIMBA.SnapshotGroupA, Interface: s.cfg.SIMBA.NetworkInterface, Logger: s.logger})
-	if err != nil {
+	var legs []*simba.Listener
+	var groups [][2]string = [][2]string{{s.cfg.SIMBA.SnapshotGroupA, s.cfg.SIMBA.SourceIPA}}
+	if s.cfg.SIMBA.SnapshotGroupB != "" {
+		groups = append(groups, [2]string{s.cfg.SIMBA.SnapshotGroupB, s.cfg.SIMBA.SourceIPB})
+	}
+	for _, g := range groups {
+		var l *simba.Listener
+		var err error
+		l, err = simba.Listen(simba.ListenerConfig{GroupAddr: g[0], SourceIP: g[1], Interface: s.cfg.SIMBA.NetworkInterface, Logger: s.logger})
+		if err != nil {
+			s.logger.Warn("forts: Snapshot multicast group failed", moex.Err(err))
+			continue
+		}
+		legs = append(legs, l)
+	}
+	if len(legs) == 0 {
 		cancel()
-		s.logger.Warn("forts: join Snapshot multicast group failed", moex.Err(err))
 		return
 	}
 	s.snapCancel = cancel
 	s.snapDone = make(chan struct{})
 	var done chan struct{} = s.snapDone
+	var wg sync.WaitGroup
+	for _, l := range legs {
+		wg.Add(1)
+		go func(l *simba.Listener) {
+			defer wg.Done()
+			defer l.Close()
+			var runErr error = l.Run(ctx, s.HandleSnapshotPacket)
+			if runErr != nil && !errors.Is(runErr, context.Canceled) {
+				s.logger.Warn("forts: Snapshot listener stopped", moex.Err(runErr))
+			}
+		}(l)
+	}
 	go func() {
-		defer close(done)
-		defer l.Close()
-		var runErr error = l.Run(ctx, s.HandleSnapshotPacket)
-		if runErr != nil && !errors.Is(runErr, context.Canceled) {
-			s.logger.Warn("forts: Snapshot listener stopped", moex.Err(runErr))
-		}
+		wg.Wait()
+		close(done)
 	}()
 }
 
@@ -291,46 +392,20 @@ func (s *BookSession) stopSnapshotListenerLocked() {
 	s.snapHave = false
 }
 
-// HandleIncrementalPacket processes one Incremental-feed datagram. Exposed
-// for replay/testing; Run feeds it from the multicast listener.
-func (s *BookSession) HandleIncrementalPacket(buf []byte) {
+// processIncrementalLocked applies one in-order Incremental datagram
+// (feed-level ordering/dedupe done by feed.go).
+func (s *BookSession) processIncrementalLocked(buf []byte) {
 	var p simba.Packet
 	var err error
 	p, err = simba.ParsePacket(buf, 0)
 	if err != nil {
-		s.mu.Lock()
 		s.stats.ParseErrors++
-		s.mu.Unlock()
+		s.metricInc(s.metrics.parseErrors)
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.stats.IncPackets++
-
+	s.metricInc(s.metrics.packets)
 	var seq uint32 = p.Header().MsgSeqNum
-	// A SequenceReset packet restarts the numbering and is itself numbered
-	// in the NEW sequence (production: SequenceReset(NewSeqNo=1) arrives
-	// with MsgSeqNum=1 after millions, and the next packet is also 1), so
-	// it must be recognised before the duplicate/gap check.
-	if newSeq, isReset := simba.SequenceResetIn(buf); isReset {
-		s.onSequenceReset(newSeq)
-		s.notifyChangedLocked()
-		return
-	}
-	if s.incHave {
-		switch {
-		case seq == s.incLast+1:
-		case seq <= s.incLast:
-			s.stats.IncDuplicates++
-			return
-		default:
-			s.stats.IncGaps++
-			s.stats.IncMissing += uint64(seq - s.incLast - 1)
-			s.logger.Warn("forts: Incremental feed gap", moex.Int("expected", int64(s.incLast+1)), moex.Int("got", int64(seq)))
-			// Which instruments are affected shows up as RptSeq gaps below.
-		}
-	}
-	s.incHave, s.incLast = true, seq
 
 	for {
 		var m simba.Message
@@ -338,6 +413,7 @@ func (s *BookSession) HandleIncrementalPacket(buf []byte) {
 		m, ok, err = p.Next()
 		if err != nil {
 			s.stats.ParseErrors++
+			s.metricInc(s.metrics.parseErrors)
 			break
 		}
 		if !ok {
@@ -406,6 +482,7 @@ func (s *BookSession) applyLocked(b *instrumentBook, d *bufferedDelta) {
 		s.stats.DuplicateUpdates++
 	case errors.Is(err, orderbook.ErrUnknownOrder):
 		s.stats.UnknownOrders++
+		s.metricInc(s.metrics.unknownOrders)
 		b.changed = true
 		s.logger.Warn("forts: update for unknown order — book may be out of sync", moex.Int("security_id", int64(b.id)), moex.Int("order_id", d.id), moex.Int("rpt_seq", int64(d.rpt)))
 	case errors.Is(err, orderbook.ErrSequenceGap):
@@ -413,6 +490,7 @@ func (s *BookSession) applyLocked(b *instrumentBook, d *bufferedDelta) {
 		last, _ = b.engine.LastSeq()
 		s.logger.Warn("forts: RptSeq gap, resyncing from snapshot", moex.Int("security_id", int64(b.id)), moex.Int("expected", int64(last+1)), moex.Int("got", int64(d.rpt)))
 		s.stats.Resyncs++
+		s.metricInc(s.metrics.resyncs)
 		s.toCollectingLocked(b)
 		// The update that revealed the gap belongs to the post-snapshot
 		// stream: keep it.
@@ -448,7 +526,7 @@ func (s *BookSession) toLiveLocked(b *instrumentBook) {
 	b.changed = true
 	b.syncCount++
 	s.collecting--
-	if s.collecting == 0 {
+	if s.collecting == 0 && !s.lossWindow {
 		s.stopSnapshotListenerLocked()
 	}
 	if s.cfg.OnState != nil {
@@ -461,11 +539,6 @@ func (s *BookSession) toLiveLocked(b *instrumentBook) {
 // numbering; books stay until the EmptyBook that follows.
 func (s *BookSession) onSequenceReset(newSeq uint32) {
 	s.stats.SequenceResets++
-	if newSeq > 0 {
-		s.incHave, s.incLast = true, newSeq-1
-	} else {
-		s.incHave = false
-	}
 	for _, b := range s.books {
 		b.engine.ResetSeq()
 	}
@@ -516,13 +589,29 @@ func (s *BookSession) HandleSnapshotPacket(buf []byte) {
 
 	var seq uint32 = p.Header().MsgSeqNum
 	var restart bool = seq == 1
-	if s.snapHave && !restart && seq != s.snapLast+1 {
-		s.stats.SnapGaps++
-		s.discardPartialSnapshotsLocked()
+	if s.snapHave && !restart {
+		if seq <= s.snapLast {
+			return // duplicate (A/B legs)
+		}
+		if seq != s.snapLast+1 {
+			s.stats.SnapGaps++
+			s.discardPartialSnapshotsLocked()
+		}
 	}
 	if restart {
 		s.stats.SnapCycles++
 		s.discardPartialSnapshotsLocked()
+		if s.lossWindow {
+			// Two restarts after the gap guarantee one complete cycle in
+			// which every instrument's snapshot was checked.
+			s.lossWindowCycles++
+			if s.lossWindowCycles >= 2 {
+				s.lossWindow = false
+				if s.collecting == 0 {
+					s.stopSnapshotListenerLocked()
+				}
+			}
+		}
 	}
 	s.snapHave, s.snapLast = true, seq
 
@@ -537,7 +626,7 @@ func (s *BookSession) HandleSnapshotPacket(buf []byte) {
 		return
 	}
 	var b *instrumentBook = s.books[v.SecurityID]
-	if b == nil || b.state != BookCollecting {
+	if b == nil || (b.state != BookCollecting && !s.lossWindow) {
 		return
 	}
 	var h simba.PacketHeader = p.Header()
@@ -578,6 +667,22 @@ func (s *BookSession) discardPartialSnapshotsLocked() {
 func (s *BookSession) completeSnapshotLocked(b *instrumentBook) {
 	var a snapshotAssembler = b.asm
 	b.asm = snapshotAssembler{}
+	if b.state == BookLive {
+		// Loss window: a live book whose RptSeq lags the snapshot's missed
+		// updates inside the lost range and has seen none since (otherwise
+		// its RptSeq gap would already have forced a resync). The snapshot
+		// is its exact state at L: reload.
+		var last uint64
+		var ok bool
+		last, ok = b.engine.LastSeq()
+		if a.R != 0 && (!ok || last < uint64(a.R)) {
+			b.engine.LoadSnapshot(a.entries, uint64(a.R))
+			b.changed = true
+			s.stats.SnapshotRepairs++
+			s.logger.Warn("forts: live book repaired from snapshot after packet loss", moex.Int("security_id", int64(b.id)), moex.Int("book_rpt", int64(last)), moex.Int("snapshot_rpt", int64(a.R)))
+		}
+		return
+	}
 	if b.overflow && a.L < b.firstSeq {
 		// Updates between L and the retained window were dropped: this
 		// snapshot cannot be merged. Wait for a fresher cycle.
@@ -587,6 +692,7 @@ func (s *BookSession) completeSnapshotLocked(b *instrumentBook) {
 	b.engine.LoadSnapshot(a.entries, uint64(a.R))
 	var pending []bufferedDelta = b.pending
 	s.stats.Syncs++
+	s.metricInc(s.metrics.syncs)
 	s.toLiveLocked(b)
 	for i := range pending {
 		if pending[i].msgSeq <= a.L {
@@ -607,6 +713,6 @@ const (
 
 // String renders stats for logs.
 func (st BookSessionStats) String() string {
-	return fmt.Sprintf("inc{packets=%d gaps=%d missing=%d dups=%d} snap{packets=%d cycles=%d gaps=%d} parse_errors=%d syncs=%d resyncs=%d unknown_orders=%d dup_updates=%d overflows=%d deferred=%d discarded=%d empty_books=%d seq_resets=%d",
-		st.IncPackets, st.IncGaps, st.IncMissing, st.IncDuplicates, st.SnapPackets, st.SnapCycles, st.SnapGaps, st.ParseErrors, st.Syncs, st.Resyncs, st.UnknownOrders, st.DuplicateUpdates, st.BufferOverflows, st.SnapshotsDeferred, st.SnapshotsDiscarded, st.EmptyBooks, st.SequenceResets)
+	return fmt.Sprintf("inc{packets=%d gaps=%d missing=%d dups=%d} snap{packets=%d cycles=%d gaps=%d} replay{requests=%d failures=%d packets=%d} parse_errors=%d syncs=%d resyncs=%d repairs=%d unknown_orders=%d dup_updates=%d overflows=%d deferred=%d discarded=%d empty_books=%d seq_resets=%d",
+		st.IncPackets, st.IncGaps, st.IncMissing, st.IncDuplicates, st.SnapPackets, st.SnapCycles, st.SnapGaps, st.Replays, st.ReplayFailures, st.ReplayedPackets, st.ParseErrors, st.Syncs, st.Resyncs, st.SnapshotRepairs, st.UnknownOrders, st.DuplicateUpdates, st.BufferOverflows, st.SnapshotsDeferred, st.SnapshotsDiscarded, st.EmptyBooks, st.SequenceResets)
 }

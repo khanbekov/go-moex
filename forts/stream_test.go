@@ -3,6 +3,7 @@ package forts
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/tonymontanov/go-moex/internal/simba"
 	"github.com/tonymontanov/go-moex/orderbook"
@@ -110,6 +111,7 @@ func newTestSession(t *testing.T) (*BookSession, *[]int32, *[]BookState) {
 	var s *BookSession = NewBookSession(BookSessionConfig{
 		OnBook:  func(id int32, e *orderbook.Engine) { changes = append(changes, id) },
 		OnState: func(id int32, st BookState) { states = append(states, st) },
+		Feed:    FeedConfig{GapTimeout: 2 * time.Millisecond},
 	})
 	return s, &changes, &states
 }
@@ -242,10 +244,13 @@ func TestBookSessionGapResync(t *testing.T) {
 	var e *orderbook.Engine = s.Subscribe(42)
 	s.HandleIncrementalPacket(incPacket(1, simba.FlagLastFragment, emptyBookMsg()))
 	s.HandleIncrementalPacket(incPacket(2, simba.FlagLastFragment, upd(42, 1, 1, 100, 5, simba.MDUpdateActionNew, simba.MDEntryTypeBid)))
-	// rpt 2 lost; rpt 3 arrives.
+	// Packet 3 (rpt 2) lost on both legs; packet 4 (rpt 3) arrives. The feed
+	// layer holds it for GapTimeout, then declares the gap and applies it —
+	// the RptSeq jump sends the instrument back to Collecting.
 	s.HandleIncrementalPacket(incPacket(4, simba.FlagLastFragment, upd(42, 3, 3, 102, 1, simba.MDUpdateActionNew, simba.MDEntryTypeOffer)))
-	if st, _ := s.State(42); st != BookCollecting || e.OrderCount() != 0 {
-		t.Fatalf("gap must clear and collect: state=%v orders=%d", st, e.OrderCount())
+	waitFor(t, func() bool { st, _ := s.State(42); return st == BookCollecting })
+	if e.OrderCount() != 0 {
+		t.Fatalf("gap must clear the book: orders=%d", e.OrderCount())
 	}
 	// Duplicate of an already-applied packet is ignored at feed level.
 	s.HandleIncrementalPacket(incPacket(4, simba.FlagLastFragment, upd(42, 3, 3, 102, 1, simba.MDUpdateActionNew, simba.MDEntryTypeOffer)))

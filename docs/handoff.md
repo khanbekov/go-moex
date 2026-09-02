@@ -142,30 +142,35 @@ forgotten between sessions.
    the crypto-index contracts, which it already does (no instrument-type
    restriction in `forts.TradingClient`). Revisit once margining currency
    is confirmed for the target contracts.
-5. **SIMBA A/B redundancy.** Spec §1.4.2 recommends joining both redundant
-   multicast groups (A and B carry identical data) and deduplicating by
-   MsgSeqNum, tolerating loss on either. v1.0's `forts/stream.go` joins
-   only group A. Deferred, not forgotten — becomes important once real
-   colocation traffic is flowing and packet loss is observed in practice.
-6. **SIMBA TCP Replay service.** Spec provides a Replay service to
-   actively request retransmission of a missed sequence range. v1.0
-   doesn't implement it — on a detected `RptSeq` gap, `orderbook.Engine`
-   is simply cleared and rebuilt from the next periodic
-   `OrderBookSnapshot`. Functionally safe, but recovery latency is "wait
-   for next snapshot cycle" instead of "instant". Revisit if that gap
-   matters in practice once trading live.
+5. **SIMBA A/B redundancy — DONE (stage 3, 2026-09-02).** `forts.BookSession`
+   joins both legs when `IncrementalGroupB`/`SnapshotGroupB` are set and
+   merges them by `MsgSeqNum` in `forts/feed.go` (duplicates dropped,
+   out-of-order packets held until the missing one arrives from either
+   leg). Joins are source-specific (`SIMBAConfig.SourceIPA/B`, Linux
+   `IP_ADD_SOURCE_MEMBERSHIP`, what MOEX's reference client does; any-source
+   fallback elsewhere). Verified offline with simulated 1–5 % loss per leg on
+   production captures (`simba-replay session -ab -loss ...`): zero book
+   mismatches.
+6. **SIMBA TCP Replay service — DONE (stage 3).** `internal/simba/replay.go`
+   implements §4.2.6 (Logon/MarketDataRequest/Logout over the Snapshot packet
+   framing, ≤1000 packets per request, 1 s activity timeout). The feed layer
+   requests a replay when a gap stays open for `FeedConfig.GapTimeout` (20 ms)
+   and falls back to the Snapshot feed if it fails or the gap is too large.
+   Untested against the real endpoint (no circuit yet) — only against the
+   protocol fake in `replay_test.go` and the capture-backed replayer of the
+   harness.
 7. **SIMBA socket buffer sizing.** `SIMBAConfig`/`ListenerConfig` expose
-   `SocketReadBufferBytes` (SO_RCVBUF) but v1.0 has no MOEX-recommended
-   value — needs to come from the colocation provisioning docs or MOEX
-   support once that environment exists.
-8. **`EmptyBook` per-instrument scoping.** The SBE `EmptyBook(4)` message
-   carries no `SecurityID` field. Per spec §4.2.8 it should apply only to
-   whatever instrument the stream's current position concerns; v1.0
-   conservatively clears the book for **every** tracked instrument on any
-   `EmptyBook`, which is safe (worst case: an extra unnecessary resync
-   wait) but coarser than the spec allows. Needs a second look once a
-   multi-instrument `WatchOrderBook` session is actually observed against
-   live traffic.
+   `SocketReadBufferBytes` (SO_RCVBUF) but there is no MOEX-recommended
+   value yet — needs to come from the colocation provisioning docs or MOEX
+   support once that environment exists. Production averages 3 500
+   packets/s on the Incremental feed with bursts at the open; start at
+   8–16 MB.
+8. **`EmptyBook` scoping — RESOLVED by captures.** `EmptyBook(4)` is a global
+   "clear every book" (daily reset / clearing, spec §4.2.8); no
+   per-instrument variant was observed in production traffic
+   (docs/pcap-findings-2026-09-02.md). After it the Incremental feed alone
+   defines the books (re-broadcast with `PossDupFlag`, `RptSeq=0`), which is
+   what `BookSession` implements.
 9. **`TimeInForceFOK` (tag 59 = "4").** Follows the FIX 4.4 standard
    enumeration; not explicitly confirmed against MOEX FORTS FIX Gate spec
    text at authoring time. Confirm against the test circuit once available.
